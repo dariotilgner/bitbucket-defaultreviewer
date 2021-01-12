@@ -1,0 +1,387 @@
+#!/usr/bin/env bash
+
+set -o errexit
+set -o nounset
+set -o pipefail
+
+clean_up() {
+    trap - ERR EXIT SIGINT SIGTERM
+    # Remove temporary files/directories, log files or rollback changes.
+}
+
+die() {
+    local -r msg="${1}"
+    local -r code="${2:-90}"
+    echo "${msg}" >&2
+    exit "${code}"
+}
+
+jq_is_required() {
+    which jq >/dev/null
+    if [[ $? -ne 0 ]]; then
+        die "jq command is missing. Please install it.
+
+        sudo apt install jq
+
+        or
+
+        brew install jq" 1
+    fi
+}
+
+jq_is_required
+
+work_dir=$(dirname "$(readlink --canonicalize-existing "${0}" 2> /dev/null)")
+
+if [[ -f "${work_dir}/.env.local" ]]; then
+    readonly conf_file="${work_dir}/.env.local"
+else
+    readonly conf_file="${work_dir}/.env"
+fi
+
+readonly error_reading_conf_file=80
+readonly script_name="${0##*/}"
+
+trap clean_up ERR EXIT SIGINT SIGTERM
+
+usage() {
+    cat <<USAGE_TEXT
+Usage: ${script_name} [-h | --help] [--version]
+
+DESCRIPTION
+    Manage the bitbucket defaultreviewers over multiple repositories in one bitbucket project.
+
+OPTIONS:
+
+    -h, --help
+    Print this help and exit.
+
+    --version
+    Print information about the author and script version.
+USAGE_TEXT
+}
+
+version() {
+    cat <<USAGE_TEXT
+Version 0.1.0
+Author: Dario Tilgner <dario.tilgner@gmail.com>
+USAGE_TEXT
+}
+
+PARAMS=""
+while (( "$#" )); do
+  case "$1" in
+    --help|-h)
+      usage
+      shift
+      ;;
+    --version)
+      version
+      shift
+      ;;
+    *) # preserve positional arguments
+      shift
+      shift
+      ;;
+  esac
+done
+
+parse_config() {
+    if [[ ! -f "${conf_file}" ]]; then
+        die "error reading configuration file: ${conf_file}" "${error_reading_conf_file}"
+    fi
+
+
+    IFS="="
+    while read -r var value; do
+        export "${var}"="${value}"
+    done < "${conf_file}"
+}
+
+parse_config "${conf_file}"
+
+check_if_bitbucket_is_reachable() {
+    local -r response_code=$(curl --silent --head --location --fail --connect-timeout 3 --output /dev/null --write-out '%{http_code}' "${bitbucket_url}")
+
+    # bitbucket urls should return HTTP 200. If it is not reachable via network (because of missing vpn) also "000" is possible.
+    if [[ "${response_code}" -ne 200 ]]; then
+        die "The bitbucket url ${bitbucket_url} is not reachable. HTTP code ${response_code}" 1
+    fi
+}
+
+check_if_bitbucket_is_reachable
+
+bitbucket_get() {
+    local -r api_url="$1"
+    local -r api_params="$2"
+
+    if [[ -z "$3" ]]; then
+        local -r api_uri_path="/rest/api/1.0/"
+    else
+        local -r api_uri_path="$3"
+    fi
+
+    curl -X GET \
+        --user "${bitbucket_user}:${bitbucket_password}" \
+        --header "X-Atlassian-Token: no-check" \
+        --silent \
+        "${bitbucket_url}${api_uri_path}${api_url}?limit=1000&${api_params}"
+    local -r curl_response_code=$?
+
+    if [[ "${curl_response_code}" -ne 0 ]]; then
+        die "GET request to bitbucket failed. Api url => ${api_uri_path}${api_url}, response error code => ${curl_response_code}" 1
+    fi
+}
+
+bitbucket_put() {
+    local -r api_url="$1"
+
+    if [[ -z "$2" ]]; then
+        local -r api_uri_path="/rest/api/1.0/"
+    else
+        local -r api_uri_path="$2"
+    fi
+
+    local -r data="$3"
+
+    curl "${bitbucket_url}${api_uri_path}${api_url}" \
+        -X PUT \
+        --user "${bitbucket_user}:${bitbucket_password}" \
+        --header "X-Atlassian-Token: no-check" \
+        --header "Content-Type: application/json" \
+        --data-binary "${data}" \
+        --silent
+    local -r curl_response_code=$?
+
+    if [[ "${curl_response_code}" -ne 0 ]]; then
+        die "GET request to bitbucket failed. Api url => ${api_uri_path}${api_url}, response error code => ${curl_response_code}" 1
+    fi
+}
+
+get_project_data() {
+    # verify that the project exists and is accessible for the user
+    # then get deeper information like the internal id and name
+    local -r response=$(bitbucket_get "projects/${bitbucket_project}" "" "")
+
+    project_key=$(echo "${response}" | jq --raw-output '.key')
+    project_id=$(echo "${response}" | jq --raw-output '.id')
+    project_name=$(echo "${response}" | jq --raw-output '.name')
+    # public, type and links are not necessary right now
+}
+
+get_project_repositories() {
+    # get a list of all repositories which belong to the project
+    local -r response=$(bitbucket_get "projects/${project_key}/repos" "" "")
+
+    repositories=$(echo "${response}" | jq --raw-output '.values[].name')
+}
+
+get_bitbucket_user_by_reviewername() {
+    local -r reviewer_name="${1}"
+
+    # as filter value you can add the name, username or email
+    # replace all spaces to + so that "Dario Tilgner" will be manipulated to "Dario+Tilgner"
+    local -r response=$(bitbucket_get "users" "permission.1=LICENSED_USER&permission.2=PROJECT_READ&permission.2.projectId=${project_id}&start=0&filter=${reviewer_name// /+}" "")
+
+    # the api will return an array of usere objects
+    local -r reviewer_objects=$(echo "${response}" | jq --raw-output '.values')
+    local -r object_length=$(echo "${reviewer_objects}" | jq length)
+
+    # we need to verify that the filter was specific enough to find one user
+    if [[ "${object_length}" -gt 1 ]]; then
+        die "More than one user found. Please specify the name. Alternatively you can use the username or email" 1
+    fi
+
+    # user does not exist
+    if [[ "${object_length}" -eq 0 ]]; then
+        die "No user found. Please specify the name. Alternatively you can use the username or email" 1
+    fi
+
+    local -r reviewer_object_as_json=$(echo "${reviewer_objects}" | jq --raw-output -c '.[]')
+
+    echo "${reviewer_object_as_json}"
+}
+
+merge_branch_strategies_for_projects() {
+    local -r chosen_repositories="${@}"
+
+    local branch_strategies=()
+    while read -r repo; do
+        # create a filterted json(!) array with all strategies
+        strategies=$(bitbucket_get "projects/${project_key}/repos/${repo}/conditions" "" "/rest/default-reviewers/1.0/"  | jq -c '.[] | {source:.sourceRefMatcher.displayId,target:.targetRefMatcher.displayId}' | jq -c -s '.')
+
+        # naturally the json array is not a bash array, therefore we have to transform it
+        # care: when you pipe the jq output into the while loop the scope of $branch_strategies will be lost due to a new opened subshell
+        while read -r strategy; do    
+            # make sure it is not empty
+            if [[ ! -z "${strategy}" ]]; then
+                branch_strategies+=("${strategy}")
+            fi
+        done < <(echo "${strategies}" | jq -c '.[]')
+
+    done <<< "${chosen_repositories}"
+
+    # make the strategies unique in case multiple repositories have the same strategy
+    IFS=$' '
+    merged_branch_strategies=($(printf "%s\n" "${branch_strategies[@]}" | sort -u | tr '\n' ' '))
+}
+
+choose_repositories_action_reviewer_strategies() {
+    local repositories_as_array=()
+    while read -r repo; do
+        repositories_as_array+=("${repo}")
+        repositories_as_array+=("")
+        repositories_as_array+=("OFF")
+    done <<< "${repositories}"
+
+    # 3>&1 1>&2 2>&3 in whiptail
+    #
+    # The way whiptail works is that the widgets are printed to stdout, while the return value is printed to stderr. We swap stdout and stderr! 
+    # Printing the widgets to stderr is perfectly valid, and we get the “return value” in stdout.
+    # The formal expression of that is 3>&1 1>&2 2>&3, which means:
+    # we create a temporary file descriptor (#3) and point it to stdout (1)
+    # we redirect stdout (1) to stderr (2)
+    # we redirect stderr (2) to the temporary file descriptor (3), which points to stdout (due to the first step)
+    # Result: stdout and stderr are switched
+    chosen_repositories=$(whiptail --separate-output --checklist "Please choose at least one repository" 30 60 24 "${repositories_as_array[@]}" 3>&1 1>&2 2>&3)
+    chosen_action=$(whiptail --radiolist "Select an action" 30 60 24 "add" "user" "OFF" "remove" "user" "OFF" 3>&1 1>&2 2>&3)
+    chosen_reviewername=$(whiptail --inputbox "Please give the reviewer full name, username or email e.g. John Smith" 30 60 "" --title "Reviewer data" 3>&1 1>&2 2>&3)
+    reviewer_user_object_as_json=$(get_bitbucket_user_by_reviewername "${chosen_reviewername}")
+
+    merge_branch_strategies_for_projects "${chosen_repositories}"
+
+    local formatted_strategies=()
+    local strategy_counter=0
+    for strategy in "${merged_branch_strategies[@]}"; do
+        displayed_strategy=$(echo "${strategy}" |  jq -c -r '. | [.source, .target] | join(" => ")' | sed "s/ANY_REF_MATCHER_ID/Anywhere/g")
+
+        formatted_strategies+=("${strategy_counter}") 
+        formatted_strategies+=("${displayed_strategy}")
+        formatted_strategies+=("OFF")
+
+        strategy_counter=$((strategy_counter+1))
+    done
+
+    local chosen_strategy_counter=$(whiptail --separate-output --checklist "Please choose at least one strategy" 30 60 24 "${formatted_strategies[@]}" 3>&1 1>&2 2>&3)
+
+    chosen_strategies=()
+    local chosen_strategy_counter=($(echo "${chosen_strategy_counter}" | tr "\n" " "))
+
+    for counter in "${chosen_strategy_counter[@]}"; do
+        chosen_strategies+=("${merged_branch_strategies[${counter}]}")
+    done
+}
+
+get_basic_bitbucket_payload_without_reviewers() {
+    local -r condition="$1"
+
+    # We cant reuse the original condition response. Some Keys differ, also the bitbucket put/post endpoints expect a smaller payload then we get (...)
+    # Therefore we parse the original condition and create a new json object without reviewers
+    echo $condition | jq --raw-output '. | {"sourceMatcher": {"id": .sourceRefMatcher.id, type: {"id": .sourceRefMatcher.type.id}}, "targetMatcher": {"id": .targetRefMatcher.id, "type": {"id": .targetRefMatcher.type.id}}, "requiredApprovals": .requiredApprovals, "scope": {"type": .scope.type, "resourceId": .scope.resourceId}}'
+}
+
+add_user_for_strategy() {
+    chosen_repositories=($(echo "${chosen_repositories}" | tr "\n" " "))
+    
+    for repo in "${chosen_repositories[@]}"; do
+        local condition=$(bitbucket_get "projects/${project_key}/repos/${repo}/conditions" "" "/rest/default-reviewers/1.0/")
+
+        if [[ -z "${condition}" ]]; then
+            # repo has no condition. Skip it
+            continue
+        fi
+
+        for strategy in "${chosen_strategies[@]}"; do
+            local source="$(echo ${strategy} | jq --raw-output '.source')"
+            local target="$(echo ${strategy} | jq --raw-output '.target')"
+            
+            local filtered_condition=$(echo "${condition}" | jq -c ".[] | select( .sourceRefMatcher.displayId == \"${source}\" and .targetRefMatcher.displayId == \"${target}\" )")
+
+            if [[ -z "${filtered_condition}" ]]; then
+                # filtered condition is empty. skip it
+                continue
+            fi
+
+            local condition_id=$(echo "${filtered_condition}" | jq '.id')
+            local user_id=$(echo "${reviewer_user_object_as_json}" | jq '.id')
+
+            # check if user is already a reviewer for the given strategy
+            local user_exists_in_reviewers=$(echo "${filtered_condition}" | jq ".reviewers | map( select(.id | contains(${user_id}) )) | length")
+            
+            if [[ "${user_exists_in_reviewers}" == "1" ]]; then
+                # user already exists
+                continue
+            fi
+
+            local reviewers_array_with_new_user=$(echo "${filtered_condition}" | jq ".reviewers |= . + [${reviewer_user_object_as_json}] | .reviewers")
+
+            # because you can not rely on the bitbucket documentation and data from get endpoints we have to remove "links" and add "avatarUrl"..
+            # example avatarUrl => /users/user.name/avatar.png?s=32&v=1530545699000"
+            local reviewers_array_with_new_user=$(echo "${reviewers_array_with_new_user}" | jq "map(del(.links) | . |= . + {\"avatarUrl\": (\"/users/\" + .name + \"/avatar.png?s=32\")})")
+            local basic_object=$(get_basic_bitbucket_payload_without_reviewers "${filtered_condition}")
+            
+            local payload=$(echo "${basic_object}" | jq -c ". += {\"reviewers\": ${reviewers_array_with_new_user}}")
+            local request=$(bitbucket_put "projects/${project_key}/repos/${repo}/condition/${condition_id}" "/rest/default-reviewers/1.0/" "${payload}")
+        done
+    done
+}
+
+remove_user_from_strategy() {
+    chosen_repositories=($(echo "${chosen_repositories}" | tr "\n" " "))
+    
+    for repo in "${chosen_repositories[@]}"; do
+        local condition=$(bitbucket_get "projects/${project_key}/repos/${repo}/conditions" "" "/rest/default-reviewers/1.0/")
+
+        if [[ -z "${condition}" ]]; then
+            # repo has no condition. Skip it
+            continue
+        fi
+
+        for strategy in "${chosen_strategies[@]}"; do
+            local source="$(echo ${strategy} | jq --raw-output '.source')"
+            local target="$(echo ${strategy} | jq --raw-output '.target')"
+
+            local filtered_condition=$(echo "${condition}" | jq -c ".[] | select( .sourceRefMatcher.displayId == \"${source}\" and .targetRefMatcher.displayId == \"${target}\" )")
+
+            if [[ -z "${filtered_condition}" ]]; then
+                # filtered condition is empty. skip it
+                continue
+            fi
+
+            local condition_id=$(echo "${filtered_condition}" | jq '.id')
+            local user_id=$(echo "${reviewer_user_object_as_json}" | jq '.id')
+
+            # check if user is already a reviewer for the given strategy
+            local user_exists_in_reviewers=$(echo "${filtered_condition}" | jq ".reviewers | map( select(.id | contains(${user_id}) )) | length")
+            
+            if [[ "${user_exists_in_reviewers}" == "0" ]]; then
+                # user not a reviewer, therefore we don't need to remove the user
+                continue
+            fi
+
+            local reviewers_array_without_selected_user=$(echo "${filtered_condition}" | jq ".reviewers | map( select(.id | contains(${user_id}) | not))")
+
+            # because you can not rely on the bitbucket documentation and data from get endpoints we have to remove "links" and add "avatarUrl"..
+            # example avatarUrl => /users/user.name/avatar.png?s=32"
+            local reviewers_array_without_selected_user=$(echo "${reviewers_array_without_selected_user}" | jq "map(del(.links) | . |= . + {\"avatarUrl\": (\"/users/\" + .name + \"/avatar.png?s=32\")})")
+            local basic_object=$(get_basic_bitbucket_payload_without_reviewers "${filtered_condition}")
+            
+            local payload=$(echo "${basic_object}" | jq -c ". += {\"reviewers\": ${reviewers_array_without_selected_user}}")
+            request=$(bitbucket_put "projects/${project_key}/repos/${repo}/condition/${condition_id}" "/rest/default-reviewers/1.0/" "${payload}")
+        done
+    done
+}
+
+get_project_data
+get_project_repositories
+choose_repositories_action_reviewer_strategies
+
+if [[ "${chosen_action}" == "add" ]]; then
+    add_user_for_strategy
+else
+    remove_user_from_strategy
+fi
+
+echo "Finished"
+
+exit 0
