@@ -129,7 +129,7 @@ bitbucket_get() {
     local -r curl_response_code=$?
 
     if [[ "${curl_response_code}" -ne 0 ]]; then
-        die "GET request to bitbucket failed. Api url => ${api_uri_path}${api_url}, response error code => ${curl_response_code}" 1
+        die "GET request to bitbucket failed. Api url => ${bitbucket_url}${api_uri_path}${api_url}?limit=1000&${api_params}, response error code => ${curl_response_code}" 1
     fi
 }
 
@@ -154,7 +154,7 @@ bitbucket_put() {
     local -r curl_response_code=$?
 
     if [[ "${curl_response_code}" -ne 0 ]]; then
-        die "GET request to bitbucket failed. Api url => ${api_uri_path}${api_url}, response error code => ${curl_response_code}" 1
+        die "PUT request to bitbucket failed. Api url => ${bitbucket_url}${api_uri_path}${api_url}, response error code => ${curl_response_code}" 1
     fi
 }
 
